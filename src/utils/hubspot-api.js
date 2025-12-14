@@ -266,34 +266,88 @@ class HubSpotAPI {
     return associationTypes[associationType] || 188; // Default to meeting_to_company
   }
 
-  async batchCreateAssociations(associations, batchSize = 10) {
+  async batchCreateAssociations(associations, batchSize = 100) {
+    if (!associations || associations.length === 0) {
+      return [];
+    }
+
     const results = [];
     
-    for (let i = 0; i < associations.length; i += batchSize) {
-      const batch = associations.slice(i, i + batchSize);
+    // Group associations by type for proper batch endpoint usage
+    const associationsByType = {};
+    
+    associations.forEach(association => {
+      const key = `${association.fromObjectType}_to_${association.toObjectType}`;
+      if (!associationsByType[key]) {
+        associationsByType[key] = [];
+      }
+      associationsByType[key].push(association);
+    });
+
+    // Process each association type separately
+    for (const [typeKey, typeAssociations] of Object.entries(associationsByType)) {
+      const fromObjectType = typeAssociations[0].fromObjectType;
+      const toObjectType = typeAssociations[0].toObjectType;
       
-      console.log(`Processing association batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(associations.length/batchSize)}`);
-      
-      const batchPromises = batch.map(async (association) => {
+      // Process in batches
+      for (let i = 0; i < typeAssociations.length; i += batchSize) {
+        const batch = typeAssociations.slice(i, i + batchSize);
+        
+        console.log(`Processing association batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(typeAssociations.length/batchSize)} for ${fromObjectType} to ${toObjectType}`);
+        
         try {
-          return await this.createAssociation(
-            association.fromObjectType,
-            association.fromObjectId,
-            association.toObjectType,
-            association.toObjectId,
-            association.associationType
+          const inputs = batch.map(association => ({
+            from: { id: association.fromObjectId },
+            to: { id: association.toObjectId },
+            type: association.associationTypeId || association.associationType // Support both until migration complete
+          }));
+
+          console.log(`Sending batch request to: /crm/v4/associations/${fromObjectType}/${toObjectType}/batch/create`);
+          console.log(`Request payload:`, JSON.stringify({ inputs }, null, 2));
+
+          const response = await this.client.post(
+            `/crm/v4/associations/${fromObjectType}/${toObjectType}/batch/create`,
+            { inputs }
           );
+          
+          console.log(`Response status: ${response.status}`);
+          console.log(`Response data:`, JSON.stringify(response.data, null, 2));
+          
+          // Handle different response formats
+          if (response.data?.results) {
+            results.push(...response.data.results);
+          }
+          
+          // Always record a successful batch completion
+          if (response.data?.status === 'COMPLETE' || response.status === 200 || response.status === 201) {
+            results.push({ 
+              success: true, 
+              status: response.data?.status || 'SUCCESS',
+              completedAt: response.data?.completedAt,
+              batch: batch.length
+            });
+          } else {
+            console.log('Unexpected response format:', response.data);
+            results.push({ warning: 'Unexpected response format', data: response.data, batch });
+          }
+          
+          // Add delay between batches
+          if (i + batchSize < typeAssociations.length) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+          
         } catch (error) {
-          console.error(`Failed to create association:`, association, error.message);
-          return { error: error.message, association };
+          console.error(`Failed to create association batch for ${fromObjectType} to ${toObjectType}:`, error.message);
+          if (error.response?.data) {
+            console.error('Response data:', JSON.stringify(error.response.data, null, 2));
+          }
+          // Continue with other batches instead of failing completely
+          results.push({ error: error.message, batch });
         }
-      });
+      }
       
-      const batchResults = await Promise.all(batchPromises);
-      results.push(...batchResults);
-      
-      // Add delay between batches
-      await new Promise(resolve => setTimeout(resolve, 1500));
+      // Add delay between different association types
+      await new Promise(resolve => setTimeout(resolve, 1000));
     }
     
     return results;

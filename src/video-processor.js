@@ -210,17 +210,22 @@ Processing Date: ${new Date().toISOString()}
     try {
       const currentBody = meeting.properties?.hs_meeting_body || '';
       
-      // Enhanced meeting body with video info
-      const enhancedBody = `${currentBody}
+      // Check if this meeting already has video information to avoid duplicates
+      if (currentBody.includes('📹 MEETING RECORDING')) {
+        console.log(`   ⚠️ Meeting ${meeting.id} already has video information, skipping update`);
+        return meeting;
+      }
+      
+      // Append video information to existing body (preserves Attio import data + participants)
+      const videoSection = `
 
-📹 MEETING RECORDING
-Recording File: ${uploadedFile.fileName}
-Video URL: ${uploadedFile.fileUrl}
-File Size: ${(uploadedFile.fileSize / (1024 * 1024)).toFixed(2)} MB
-Processed: ${new Date().toISOString()}
+📹 Call recording
+Video: ${uploadedFile.fileUrl}
 
-📝 TRANSCRIPT
-${transcript}`.trim();
+📝 Transcript
+${transcript}`;
+
+      const enhancedBody = `${currentBody}${videoSection}`.trim();
 
       // Update the meeting
       const response = await this.hubspot.client.patch(`/crm/v3/objects/meetings/${meeting.id}`, {

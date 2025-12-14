@@ -28,118 +28,111 @@ class ComprehensiveVideoProcessor extends VideoProcessor {
   }
   
   /**
-   * Enhanced matching that looks for meeting ID in various HubSpot properties
+   * Find HubSpot meeting by Attio meeting ID using the "Original ID:" marker from Script 1
    */
   async findMatchingMeetingComprehensive(videoFile) {
     const existingMeetings = await this.loadExistingMeetings();
     const { meetingId, videoId } = videoFile;
     
-    // Strategy 1: Look for exact match in meeting body/description (most likely)
-    let match = existingMeetings.find(meeting => {
+    // Parse filename to get proper IDs
+    const { callId, attioMeetingId } = this.parseVideoFilename(videoFile.filename);
+    
+    let targetMeetingId = attioMeetingId || meetingId;
+    
+    // If we only have a call ID, we need to map it to a meeting ID via Attio
+    if (!targetMeetingId && callId) {
+      console.log(`   🔄 Only have call ID ${callId}, need to map to meeting ID via Attio`);
+      // TODO: Implement Attio API call to map call_id -> meeting_id
+      // For now, mark as unmatchable
+      return null;
+    }
+    
+    if (!targetMeetingId) {
+      console.log('   ❌ No valid meeting ID found in filename');
+      return null;
+    }
+    
+    // Look for exact match in meeting body using "Original ID:" pattern from Script 1
+    const match = existingMeetings.find(meeting => {
       const body = meeting.properties?.hs_meeting_body || '';
-      return body.includes(meetingId) || body.includes(videoId);
+      return body.includes(`Original ID: ${targetMeetingId}`);
     });
     
     if (match) {
       return {
         meeting: match,
         confidence: 1.0,
-        matchType: 'body_content_match',
-        matchedId: meetingId
-      };
-    }
-    
-    // Strategy 2: Look for match in meeting title
-    match = existingMeetings.find(meeting => {
-      const title = meeting.properties?.hs_meeting_title || '';
-      return title.includes(meetingId) || title.includes(videoId);
-    });
-    
-    if (match) {
-      return {
-        meeting: match,
-        confidence: 0.9,
-        matchType: 'title_content_match',
-        matchedId: meetingId
-      };
-    }
-    
-    // Strategy 3: Check if there's a custom property storing the Attio ID
-    // (In case the original migration used different property names)
-    match = existingMeetings.find(meeting => {
-      return Object.values(meeting.properties || {}).some(value => 
-        typeof value === 'string' && (value === meetingId || value === videoId)
-      );
-    });
-    
-    if (match) {
-      return {
-        meeting: match,
-        confidence: 0.8,
-        matchType: 'property_value_match',
-        matchedId: meetingId
+        matchType: 'attio_id_match',
+        matchedId: targetMeetingId
       };
     }
     
     // No match found
+    console.log(`   ❌ No HubSpot meeting found with Attio ID: ${targetMeetingId}`);
     return null;
   }
   
   /**
-   * Create new HubSpot meeting with proper required properties
+   * Parse video filename to extract call ID and meeting ID
    */
-  async createNewMeetingFixed(videoFile, transcript) {
-    try {
-      const meetingDate = videoFile.created.toLocaleDateString('en-US', {
-        year: 'numeric',
-        month: 'long', 
-        day: 'numeric'
-      });
-      
-      const meetingTitle = `Attio Call - ${meetingDate}`;
-      const meetingTimestamp = videoFile.created.getTime();
-      
-      // Create meeting description with all the details
-      const meetingDescription = `Attendee description
-
-📹 Call Recording
-🎥 Video: Click to watch video
-
-🔗 Direct link: https://api-eu1.hubspot.com/filemanager/api/v2/files/placeholder-file-id/signed-url-redirect?portalId=147152397
-
-🆔 Recording ID: ${videoFile.meetingId}_${videoFile.videoId}
-
-📝 Call Transcript
-${transcript}
-
-📹 MEETING RECORDING
-Recording File: ${videoFile.filename}
-Video URL: placeholder-url-${videoFile.videoId}
-File Size: ${(videoFile.size / (1024 * 1024)).toFixed(2)} MB
-Processed: ${new Date().toISOString()}
-
-📝 TRANSCRIPT
-${transcript}`;
-
-      // Create meeting with required properties only
-      const meetingProperties = {
-        hs_meeting_title: meetingTitle,
-        hs_meeting_body: meetingDescription,
-        hs_meeting_start_time: meetingTimestamp,
-        hs_meeting_end_time: meetingTimestamp + (60 * 60 * 1000),
-        hs_timestamp: meetingTimestamp, // Required!
-        hs_meeting_outcome: 'COMPLETED'
+  parseVideoFilename(filename) {
+    // Remove extension
+    const baseName = filename.replace(/\.[^.]+$/, '');
+    
+    // Pattern 1: meeting-<meeting-id>.mp4 or meeting-<meeting-id>-<call-id>.mp4
+    const meetingMatch = baseName.match(/^meeting-([a-f0-9-]+)(?:-([a-f0-9-]+))?$/);
+    if (meetingMatch) {
+      return {
+        attioMeetingId: meetingMatch[1],
+        callId: meetingMatch[2] || null
       };
+    }
+    
+    // Pattern 2: call-recording-<call-id>.mp4 (old format)
+    const callMatch = baseName.match(/^call-recording-([a-f0-9-]+)$/);
+    if (callMatch) {
+      return {
+        callId: callMatch[1],
+        attioMeetingId: null
+      };
+    }
+    
+    // Fallback: couldn't parse
+    return {
+      callId: null,
+      attioMeetingId: null
+    };
+  }
+  
+  /**
+   * DISABLED: We don't create new meetings in Script 2
+   * Script 2 only updates existing meetings that were created by Script 1
+   */
+  // createNewMeetingFixed method removed to prevent duplicate meetings
+  
+  /**
+   * Upload video file to HubSpot file manager and get real URL
+   */
+  async uploadFileToHubSpot(videoFile) {
+    try {
+      // This should use the actual HubSpot file upload API
+      // For now, implementing the base VideoProcessor upload logic
+      const uploadResult = await this.uploadVideo(videoFile);
       
-      const response = await this.hubspot.client.post('/crm/v3/objects/meetings', {
-        properties: meetingProperties
-      });
-      
-      return response.data;
-      
+      return {
+        fileName: videoFile.filename,
+        fileUrl: uploadResult.url,
+        fileId: uploadResult.id,
+        fileSize: videoFile.size
+      };
     } catch (error) {
-      console.error(`Error creating meeting: ${error.response?.data?.message || error.message}`);
-      throw error;
+      console.error(`   ❌ Failed to upload video: ${error.message}`);
+      // Return placeholder for now but log the error
+      return {
+        fileName: videoFile.filename,
+        fileUrl: `[Upload failed: ${error.message}]`,
+        fileSize: videoFile.size
+      };
     }
   }
   
@@ -172,14 +165,12 @@ ${transcript}`;
       const existingMatch = await this.findMatchingMeetingComprehensive(videoFile);
       
       if (existingMatch) {
-        // Found existing meeting - update it
+        // Found existing meeting - update it with video and transcript
         console.log(`   ✅ Found existing meeting: ${existingMatch.meeting.id} (${existingMatch.matchType})`);
         
-        const uploadedFile = { 
-          fileName: videoFile.filename, 
-          fileUrl: `placeholder-url-${videoFile.videoId}`, 
-          fileSize: videoFile.size 
-        };
+        // Upload video file to HubSpot to get real URL
+        console.log('   📤 Uploading video file to HubSpot...');
+        const uploadedFile = await this.uploadFileToHubSpot(videoFile);
         
         await this.updateMeetingWithVideo(existingMatch.meeting, videoFile, transcript, uploadedFile);
         
@@ -190,22 +181,16 @@ ${transcript}`;
         console.log(`   ✅ Updated existing meeting ${existingMatch.meeting.id}`);
         
       } else {
-        // No existing meeting found - create new one
-        console.log('   🆕 No existing meeting found - creating new one...');
+        // No existing meeting found - log for manual review
+        console.log('   ❌ No existing meeting found - adding to unmatched list');
         
-        const newMeeting = await this.createNewMeetingFixed(videoFile, transcript);
+        result.action = 'unmatched';
+        result.hubspotMeetingId = null;
         
-        result.action = 'created';
-        result.hubspotMeetingId = newMeeting.id;
-        
-        console.log(`   ✅ Created new meeting ${newMeeting.id}`);
+        console.log(`   ⚠️  Video ${videoFile.filename} could not be matched to any existing meeting`);
       }
       
-      // Step 3: Create associations with contacts, companies, and deals
-      if (result.hubspotMeetingId) {
-        console.log('   🔗 Creating associations...');
-        await this.createMeetingAssociations(result.hubspotMeetingId, videoFile);
-      }
+      // Script 2 doesn't create associations - they're already set by Script 1
       
       result.success = true;
       
@@ -218,81 +203,10 @@ ${transcript}`;
   }
   
   /**
-   * Create associations between meeting and related contacts, companies, deals
+   * DISABLED: Script 2 doesn't create associations
+   * All associations are already set by Script 1 (comprehensive-meeting-processor.js)
    */
-  async createMeetingAssociations(hubspotMeetingId, videoFile) {
-    try {
-      // Load existing company and contact mappings from previous migration data
-      let companyMappings = {};
-      let contactMappings = {};
-      let dealMappings = {};
-      
-      try {
-        companyMappings = await this.dataManager.loadData('company_name_mapping.json') || { matches: [] };
-        contactMappings = await this.dataManager.loadData('contact_email_mapping.json') || { matches: [] };
-        dealMappings = await this.dataManager.loadData('deal_name_mapping.json') || { matches: [] };
-      } catch (error) {
-        console.log('     ⚠️  No existing mapping data found, skipping associations');
-        return;
-      }
-      
-      // Extract Attio meeting ID from video file for association lookup
-      const attioMeetingId = videoFile.meetingId;
-      
-      // For now, create sample associations based on common patterns
-      // In production, this would load Attio meeting data and match associations
-      const associationsToCreate = [];
-      
-      // Example: Create association with first available company if found
-      if (companyMappings.matches && companyMappings.matches.length > 0) {
-        const firstCompany = companyMappings.matches[0];
-        associationsToCreate.push({
-          fromObjectType: 'meetings',
-          fromObjectId: hubspotMeetingId,
-          toObjectType: 'companies',
-          toObjectId: firstCompany.hubspotId,
-          associationType: 'meeting_to_company'
-        });
-      }
-      
-      // Example: Create association with first available contact if found
-      if (contactMappings.matches && contactMappings.matches.length > 0) {
-        const firstContact = contactMappings.matches[0];
-        associationsToCreate.push({
-          fromObjectType: 'meetings',
-          fromObjectId: hubspotMeetingId,
-          toObjectType: 'contacts',
-          toObjectId: firstContact.hubspotId,
-          associationType: 'meeting_to_contact'
-        });
-      }
-      
-      // Create the associations
-      if (associationsToCreate.length > 0) {
-        console.log(`     🔗 Creating ${associationsToCreate.length} associations...`);
-        
-        for (const association of associationsToCreate) {
-          try {
-            await this.hubspot.createAssociation(
-              association.fromObjectType,
-              association.fromObjectId,
-              association.toObjectType,
-              association.toObjectId,
-              association.associationType
-            );
-            console.log(`     ✅ Associated with ${association.toObjectType}: ${association.toObjectId}`);
-          } catch (error) {
-            console.log(`     ⚠️  Failed to create ${association.associationType}: ${error.message}`);
-          }
-        }
-      } else {
-        console.log('     ℹ️  No associations to create');
-      }
-      
-    } catch (error) {
-      console.error(`     ❌ Error creating associations: ${error.message}`);
-    }
-  }
+  // createMeetingAssociations method removed - Script 1 handles all associations
 
   /**
    * Process all videos with comprehensive matching and creation
@@ -343,17 +257,17 @@ ${transcript}`;
       const successful = results.filter(r => r.success);
       const failed = results.filter(r => !r.success);
       const matched = results.filter(r => r.action === 'matched');
-      const created = results.filter(r => r.action === 'created');
+      const unmatched = results.filter(r => r.action === 'unmatched');
       
       console.log('\n' + '='.repeat(80));
-      console.log('COMPREHENSIVE VIDEO PROCESSING RESULTS');
+      console.log('SCRIPT 2: VIDEO PROCESSING RESULTS');
       console.log('='.repeat(80));
       console.log(`📊 Summary:`);
       console.log(`   Total processed: ${results.length}`);
       console.log(`   Successful: ${successful.length}`);
       console.log(`   Failed: ${failed.length}`);
       console.log(`   Matched existing meetings: ${matched.length}`);
-      console.log(`   Created new meetings: ${created.length}`);
+      console.log(`   Unmatched videos (need manual review): ${unmatched.length}`);
       
       if (matched.length > 0) {
         console.log('\n✅ Matched to existing meetings:');
@@ -362,11 +276,15 @@ ${transcript}`;
         });
       }
       
-      if (created.length > 0) {
-        console.log('\n🆕 Created new meetings:');
-        created.forEach((result, index) => {
-          console.log(`   ${index + 1}. ${result.videoFile} → New Meeting ${result.hubspotMeetingId}`);
+      if (unmatched.length > 0) {
+        console.log('\n⚠️  Unmatched videos (require manual review):');
+        unmatched.forEach((result, index) => {
+          console.log(`   ${index + 1}. ${result.videoFile} - Could not find matching meeting`);
         });
+        console.log('\n   💡 These videos may need:');
+        console.log('      - Attio call ID → meeting ID mapping');
+        console.log('      - Manual association with existing meetings');
+        console.log('      - Verification that the meetings were migrated in Script 1');
       }
       
       if (failed.length > 0) {
@@ -385,7 +303,7 @@ ${transcript}`;
         processed: successful.length, 
         errors: failed.length, 
         matched: matched.length, 
-        created: created.length, 
+        unmatched: unmatched.length, 
         results 
       };
       
@@ -403,8 +321,9 @@ if (require.main === module) {
   const processor = new ComprehensiveVideoProcessor();
   processor.processAllVideosComprehensive()
     .then((result) => {
-      console.log('\n🎉 Comprehensive video processing completed!');
-      console.log(`✅ Successful: ${result.processed} (${result.matched} matched, ${result.created} created)`);
+      console.log('\n🎉 Script 2: Video processing completed!');
+      console.log(`✅ Successful: ${result.processed} (${result.matched} matched)`);
+      console.log(`⚠️  Unmatched: ${result.unmatched}`);
       console.log(`❌ Failed: ${result.errors}`);
       process.exit(0);
     })

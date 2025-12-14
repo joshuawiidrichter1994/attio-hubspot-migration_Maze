@@ -7,6 +7,14 @@ class ComprehensiveMeetingProcessor {
   constructor() {
     this.hubspot = new HubSpotAPI();
     this.attio = new AttioAPI();
+    
+    // HubSpot association type IDs
+    this.ASSOCIATION_TYPE_IDS = {
+      meeting_to_contact: 200,
+      meeting_to_company: 202,
+      meeting_to_deal: 204
+    };
+    
     this.processedCount = 0;
     this.skippedCount = 0;
     this.errorCount = 0;
@@ -285,8 +293,8 @@ class ComprehensiveMeetingProcessor {
 
     const values = attioMeeting.values || {};
 
-    // 2.1 Contacts from participants
-    const participants = 
+    // 1) Contacts from participants (already mostly correct)
+    const participants =
       values.participants ||
       values.attendees ||
       values.people ||
@@ -298,69 +306,80 @@ class ComprehensiveMeetingProcessor {
     for (const participant of participants) {
       try {
         let hubspotContact = null;
-        
+
+        // If you ever had Attio person IDs on participants, this would catch them
         if (participant.target_object === 'people' || participant.type === 'person') {
-          // Use Attio contact ID lookup
           const attioContactId = participant.target_record_id || participant.id;
           hubspotContact = await this.findHubSpotContact(attioContactId);
         } else if (participant.email_address) {
-          // Use email lookup
+          // This is the path that actually matches the real Attio schema
           hubspotContact = await this.findHubSpotContactByEmail(participant.email_address);
         }
-        
+
         if (hubspotContact) {
           contactIds.add(hubspotContact.id);
         }
-      } catch (error) {
-        // Skip problematic participants
+      } catch {
         continue;
       }
     }
 
-    // 2.2 Companies & deals from Attio meeting links (source of truth)
-    // Check multiple possible locations for linked records
-    const linkedRecords = 
-      values.linked_records ||
-      values.accounts ||
-      values.organizations ||
+    // 2) Companies & deals from Attio linked_records (REAL source of truth)
+    // NOTE: Attio schema puts this on the top-level meeting, *not* under values
+    const linkedRecords =
       attioMeeting.linked_records ||
+      values.linked_records || // fallback just in case
       [];
 
-    // Process linked records
     for (const record of linkedRecords) {
       try {
-        const recordType = record.target_object || record.type;
-        const recordId = record.target_record_id || record.id;
-        
-        if ((recordType === 'companies' || recordType === 'accounts') && recordId) {
+        // Attio official fields
+        const objectSlug =
+          record.object_slug ||
+          record.target_object ||
+          record.type;
+
+        const recordId =
+          record.record_id ||
+          record.target_record_id ||
+          record.id;
+
+        if (!objectSlug || !recordId) continue;
+
+        // Standard Attio object slugs: people, companies, deals, users, workspaces
+        if (objectSlug === 'companies' || objectSlug === 'company') {
           const hubspotCompany = await this.findHubSpotCompany(recordId);
-          if (hubspotCompany) {
-            companyIds.add(hubspotCompany.id);
-          }
-        } else if ((recordType === 'deals' || recordType === 'opportunities') && recordId) {
+          if (hubspotCompany) companyIds.add(hubspotCompany.id);
+        } else if (objectSlug === 'deals' || objectSlug === 'deal') {
           const hubspotDeal = await this.findHubSpotDeal(recordId);
-          if (hubspotDeal) {
-            dealIds.add(hubspotDeal.id);
-          }
+          if (hubspotDeal) dealIds.add(hubspotDeal.id);
+        } else if (objectSlug === 'people' || objectSlug === 'person') {
+          // Optional: if people are linked via records rather than participants
+          const hubspotContact = await this.findHubSpotContact(recordId);
+          if (hubspotContact) contactIds.add(hubspotContact.id);
         }
       } catch (error) {
-        // Skip problematic records
+        console.error('Error mapping linked_record', record, error.message);
         continue;
       }
     }
 
-    // Also check legacy structures for backward compatibility
-    const legacyCompanies = values.companies || values.accounts || attioMeeting.companies || attioMeeting.accounts || [];
+    // 3) Legacy fallbacks (keep as-is in case some old structures exist)
+    const legacyCompanies =
+      values.companies ||
+      values.accounts ||
+      attioMeeting.companies ||
+      attioMeeting.accounts ||
+      [];
+
     for (const company of legacyCompanies) {
       try {
         const attioCompanyId = company.target_record_id || company.id;
         if (attioCompanyId) {
           const hubspotCompany = await this.findHubSpotCompany(attioCompanyId);
-          if (hubspotCompany) {
-            companyIds.add(hubspotCompany.id);
-          }
+          if (hubspotCompany) companyIds.add(hubspotCompany.id);
         }
-      } catch (error) {
+      } catch {
         continue;
       }
     }
@@ -371,11 +390,9 @@ class ComprehensiveMeetingProcessor {
         const attioDealId = deal.target_record_id || deal.id;
         if (attioDealId) {
           const hubspotDeal = await this.findHubSpotDeal(attioDealId);
-          if (hubspotDeal) {
-            dealIds.add(hubspotDeal.id);
-          }
+          if (hubspotDeal) dealIds.add(hubspotDeal.id);
         }
-      } catch (error) {
+      } catch {
         continue;
       }
     }
@@ -384,11 +401,139 @@ class ComprehensiveMeetingProcessor {
   }
 
   /**
+   * Fix associations for an existing HubSpot meeting:
+   * - Reads existing associations (contacts/companies/deals)
+   * - Computes what's missing based on Attio
+   * - Creates ONLY the missing associations
+   */
+  async fixMeetingAssociations(hubspotMeeting, attioMeeting) {
+    try {
+      if (!hubspotMeeting || !hubspotMeeting.id) {
+        console.log('   ⚠️ Cannot fix associations: missing HubSpot meeting ID');
+        return;
+      }
+
+      const meetingId = hubspotMeeting.id;
+      console.log(`   🔧 Fixing associations for meeting ${meetingId}...`);
+
+      // 1) Read existing associations
+      const existingContacts = new Set();
+      const existingCompanies = new Set();
+      const existingDeals = new Set();
+
+      try {
+        const existing = await this.hubspot.client.get(
+          `/crm/v3/objects/meetings/${meetingId}`,
+          { params: { associations: 'contacts,companies,deals' } }
+        );
+
+        const assoc = existing.data?.associations || {};
+
+        if (assoc.contacts?.results?.length) {
+          assoc.contacts.results.forEach(r => existingContacts.add(r.id));
+        }
+        if (assoc.companies?.results?.length) {
+          assoc.companies.results.forEach(r => existingCompanies.add(r.id));
+        }
+        if (assoc.deals?.results?.length) {
+          assoc.deals.results.forEach(r => existingDeals.add(r.id));
+        }
+
+        console.log(
+          `     Existing: ${existingContacts.size} contacts, ` +
+          `${existingCompanies.size} companies, ${existingDeals.size} deals`
+        );
+      } catch (error) {
+        if (error.response?.status === 404) {
+          console.log(
+            `   ⚠️ Meeting ${meetingId} returned 404 when reading associations. ` +
+            `It may have been deleted – skipping fix for this record.`
+          );
+          return;
+        }
+        throw error;
+      }
+
+      // 2) Desired associations
+      const { contactIds, companyIds, dealIds } =
+        await this.getDesiredAssociationsForMeeting(attioMeeting);
+
+      const desiredContacts = Array.from(contactIds || []);
+      const desiredCompanies = Array.from(companyIds || []);
+      const desiredDeals = Array.from(dealIds || []);
+
+      // 3) Compute missing ones
+      const missingContacts = desiredContacts.filter(id => !existingContacts.has(id));
+      const missingCompanies = desiredCompanies.filter(id => !existingCompanies.has(id));
+      const missingDeals = desiredDeals.filter(id => !existingDeals.has(id));
+
+      const totalMissing =
+        missingContacts.length + missingCompanies.length + missingDeals.length;
+
+      if (totalMissing === 0) {
+        console.log(`   ✅ Associations already correct for meeting ${meetingId}`);
+        return;
+      }
+
+      console.log(
+        `   ❗ Fixing ${totalMissing} missing associations for meeting ${meetingId} ` +
+        `(${missingContacts.length} contacts, ` +
+        `${missingCompanies.length} companies, ` +
+        `${missingDeals.length} deals)`
+      );
+
+      const associations = [];
+
+      missingContacts.forEach(contactId => {
+        associations.push({
+          fromObjectType: 'meetings',
+          fromObjectId: meetingId,
+          toObjectType: 'contacts',
+          toObjectId: contactId,
+          associationTypeId: this.ASSOCIATION_TYPE_IDS.meeting_to_contact
+        });
+      });
+
+      missingCompanies.forEach(companyId => {
+        associations.push({
+          fromObjectType: 'meetings',
+          fromObjectId: meetingId,
+          toObjectType: 'companies',
+          toObjectId: companyId,
+          associationTypeId: this.ASSOCIATION_TYPE_IDS.meeting_to_company
+        });
+      });
+
+      missingDeals.forEach(dealId => {
+        associations.push({
+          fromObjectType: 'meetings',
+          fromObjectId: meetingId,
+          toObjectType: 'deals',
+          toObjectId: dealId,
+          associationTypeId: this.ASSOCIATION_TYPE_IDS.meeting_to_deal
+        });
+      });
+
+      if (associations.length > 0) {
+        console.log(`     📎 Creating ${associations.length} missing associations...`);
+        await this.hubspot.batchCreateAssociations(associations);
+        console.log(`     ✅ Created missing associations for meeting ${meetingId}`);
+      }
+
+    } catch (error) {
+      console.error(
+        `   ❌ Error fixing associations for meeting ${hubspotMeeting?.id}:`,
+        error.message
+      );
+    }
+  }
+
+  /**
    * Prepare meeting data from Attio meeting for HubSpot creation
    */
   prepareMeetingData(attioMeeting) {
     // Handle both flat and nested data structures
-    const values = attioMeeting.values;
+    const values = attioMeeting.values || {};
     
     // Extract meeting details (handle both structures)
     const title = values?.title?.[0]?.value || attioMeeting.title || 'Meeting imported from Attio';
@@ -414,34 +559,55 @@ class ComprehensiveMeetingProcessor {
       throw new Error(`Meeting "${title}" has no start time - HubSpot requires meeting start/end times`);
     }
     
-    // 3.1 Build structured participant list for description
+    // 3.1 Build structured participant list for description - handle missing values object
     const participants =
-      values.participants ||
-      values.attendees ||
-      values.people ||
+      values?.participants ||
+      values?.attendees ||
+      values?.people ||
       attioMeeting.participants ||
       attioMeeting.attendees ||
       attioMeeting.people ||
       [];
 
-    const participantLines = participants.map(p => {
-      const name =
-        p.name ||
-        p.full_name ||
-        [p.first_name, p.last_name].filter(Boolean).join(' ') ||
-        p.display_name ||
-        '';
+    // Safely process participants with error handling for malformed data
+    const participantLines = [];
+    const attendeeEmails = []; // Collect emails for HubSpot attendees field
+    
+    if (Array.isArray(participants)) {
+      participants.forEach((p, index) => {
+        try {
+          // Handle both object and primitive participant data
+          if (!p || typeof p !== 'object') {
+            console.log(`⚠️  Skipping malformed participant at index ${index}:`, p);
+            return;
+          }
 
-      const email = p.email_address || p.email || '';
-      const status = p.status ? ` [${p.status}]` : '';
-      const role = p.is_organizer ? ' (host)' : '';
+          const name =
+            p.name ||
+            p.full_name ||
+            [p.first_name, p.last_name].filter(Boolean).join(' ') ||
+            p.display_name ||
+            '';
 
-      let label = name || email || 'Unknown participant';
-      if (email && name) label += ` <${email}>`;
-      else if (email && !name) label = email;
+          const email = p.email_address || p.email || '';
+          const status = p.status ? ` [${p.status}]` : '';
+          const role = p.is_organizer ? ' (host)' : '';
 
-      return `- ${label}${role}${status}`;
-    });
+          // Add email to attendees list if valid
+          if (email && email.includes('@')) {
+            attendeeEmails.push(email);
+          }
+
+          let label = name || email || 'Unknown participant';
+          if (email && name) label += ` <${email}>`;
+          else if (email && !name) label = email;
+
+          participantLines.push(`- ${label}${role}${status}`);
+        } catch (error) {
+          console.log(`⚠️  Error processing participant at index ${index}:`, error.message);
+        }
+      });
+    }
 
     let participantsSection = '';
     if (participantLines.length > 0) {
@@ -470,6 +636,12 @@ ${participantLines.join('\n')}`;
         hs_meeting_start_time: new Date(startTime).toISOString(),
       }
     };
+
+    // Add attendee emails if we have any
+    if (attendeeEmails.length > 0) {
+      // HubSpot expects attendee emails as a semicolon-separated string
+      meetingData.properties.hs_attendee_emails = attendeeEmails.join(';');
+    }
 
     // Add end time if available
     if (endTime) {
@@ -516,7 +688,7 @@ ${participantLines.join('\n')}`;
           fromObjectId: hubspotMeeting.id,
           toObjectType: 'contacts',
           toObjectId: contactId,
-          associationType: 'meeting_to_contact'
+          associationTypeId: this.ASSOCIATION_TYPE_IDS.meeting_to_contact
         });
       }
       
@@ -527,7 +699,7 @@ ${participantLines.join('\n')}`;
           fromObjectId: hubspotMeeting.id,
           toObjectType: 'companies',
           toObjectId: companyId,
-          associationType: 'meeting_to_company'
+          associationTypeId: this.ASSOCIATION_TYPE_IDS.meeting_to_company
         });
       }
       
@@ -538,7 +710,7 @@ ${participantLines.join('\n')}`;
           fromObjectId: hubspotMeeting.id,
           toObjectType: 'deals',
           toObjectId: dealId,
-          associationType: 'meeting_to_deal'
+          associationTypeId: this.ASSOCIATION_TYPE_IDS.meeting_to_deal
         });
       }
       
@@ -653,90 +825,377 @@ ${participantLines.join('\n')}`;
   }
 
   /**
-   * Verify and fix associations for existing meetings
+   * Verify associations for an existing HubSpot meeting against what we expect
+   * from Attio. This is a READ-ONLY check – it just logs discrepancies.
+   *
+   * NOTE:
+   * - Uses CRM v3 meetings endpoint with `associations=contacts,companies,deals`
+   * - The previous implementation used `/crm/v4/objects/meetings/{id}/associations`
+   *   which is not a valid endpoint and always returned 404.
    */
   async verifyMeetingAssociations(hubspotMeeting, attioMeeting) {
     try {
-      console.log(`   🔍 Verifying associations for meeting ${hubspotMeeting.id}...`);
-      
-      // Get existing associations
-      const existingAssociations = await this.hubspot.client.get(`/crm/v4/objects/meetings/${hubspotMeeting.id}/associations`);
-      
+      if (!hubspotMeeting || !hubspotMeeting.id) {
+        console.log('   ⚠️ Cannot verify associations: missing HubSpot meeting ID');
+        return;
+      }
+
+      const meetingId = hubspotMeeting.id;
+      console.log(`   🔍 Verifying associations for meeting ${meetingId}...`);
+
+      // -------------------------------------------------------------------
+      // 1) Get existing associations from HubSpot (contacts/companies/deals)
+      // -------------------------------------------------------------------
       const existingContacts = new Set();
       const existingCompanies = new Set();
       const existingDeals = new Set();
-      
-      existingAssociations.data.results.forEach(assoc => {
-        if (assoc.toObjectType === 'contacts') {
-          existingContacts.add(assoc.toObjectId);
-        } else if (assoc.toObjectType === 'companies') {
-          existingCompanies.add(assoc.toObjectId);
-        } else if (assoc.toObjectType === 'deals') {
-          existingDeals.add(assoc.toObjectId);
+
+      try {
+        const existing = await this.hubspot.client.get(
+          `/crm/v3/objects/meetings/${meetingId}`,
+          {
+            params: {
+              associations: 'contacts,companies,deals'
+            }
+          }
+        );
+
+        const assoc = existing.data?.associations || {};
+
+        if (assoc.contacts?.results?.length) {
+          assoc.contacts.results.forEach(r => existingContacts.add(r.id));
         }
-      });
-      
-      console.log(`     Existing: ${existingContacts.size} contacts, ${existingCompanies.size} companies, ${existingDeals.size} deals`);
-      
-      // Get desired associations using the new helper
-      const { contactIds, companyIds, dealIds } = await this.getDesiredAssociationsForMeeting(attioMeeting);
-      
-      // Build missing associations array
-      const missingAssociations = [];
-      
-      // Check for missing contact associations
-      for (const contactId of contactIds) {
-        if (!existingContacts.has(contactId)) {
-          missingAssociations.push({
-            fromObjectType: 'meetings',
-            fromObjectId: hubspotMeeting.id,
-            toObjectType: 'contacts',
-            toObjectId: contactId,
-            associationType: 'meeting_to_contact'
-          });
+        if (assoc.companies?.results?.length) {
+          assoc.companies.results.forEach(r => existingCompanies.add(r.id));
         }
-      }
-      
-      // Check for missing company associations
-      for (const companyId of companyIds) {
-        if (!existingCompanies.has(companyId)) {
-          missingAssociations.push({
-            fromObjectType: 'meetings',
-            fromObjectId: hubspotMeeting.id,
-            toObjectType: 'companies',
-            toObjectId: companyId,
-            associationType: 'meeting_to_company'
-          });
+        if (assoc.deals?.results?.length) {
+          assoc.deals.results.forEach(r => existingDeals.add(r.id));
         }
-      }
-      
-      // Check for missing deal associations
-      for (const dealId of dealIds) {
-        if (!existingDeals.has(dealId)) {
-          missingAssociations.push({
-            fromObjectType: 'meetings',
-            fromObjectId: hubspotMeeting.id,
-            toObjectType: 'deals',
-            toObjectId: dealId,
-            associationType: 'meeting_to_deal'
-          });
+
+        console.log(
+          `     Existing: ${existingContacts.size} contacts, ` +
+          `${existingCompanies.size} companies, ${existingDeals.size} deals`
+        );
+      } catch (error) {
+        if (error.response?.status === 404) {
+          console.log(
+            `   ⚠️ Meeting ${meetingId} returned 404 when reading associations. ` +
+            `It may have been deleted – skipping association verification for this record.`
+          );
+          return;
         }
+
+        // Any other error is real and should bubble up
+        throw error;
       }
-      
-      // Create missing associations (don't delete anything)
-      if (missingAssociations.length > 0) {
-        console.log(`     📎 Adding ${missingAssociations.length} missing associations...`);
-        await this.hubspot.batchCreateAssociations(missingAssociations);
-        console.log(`     ✅ Added missing associations`);
-      } else {
-        console.log(`     ✅ All associations are correct`);
+
+      // -------------------------------------------------------------------
+      // 2) Desired associations from Attio mapping
+      // -------------------------------------------------------------------
+      const { contactIds, companyIds, dealIds } =
+        await this.getDesiredAssociationsForMeeting(attioMeeting);
+
+      const desiredContacts = Array.from(contactIds || []);
+      const desiredCompanies = Array.from(companyIds || []);
+      const desiredDeals = Array.from(dealIds || []);
+
+      // -------------------------------------------------------------------
+      // 3) Diff: what is missing in HubSpot vs what we expect
+      // -------------------------------------------------------------------
+      const missingContacts = desiredContacts.filter(id => !existingContacts.has(id));
+      const missingCompanies = desiredCompanies.filter(id => !existingCompanies.has(id));
+      const missingDeals = desiredDeals.filter(id => !existingDeals.has(id));
+
+      const totalMissing =
+        missingContacts.length + missingCompanies.length + missingDeals.length;
+
+      if (totalMissing === 0) {
+        console.log(`   ✅ Associations already correct for meeting ${meetingId}`);
+        return;
       }
-      
-      // 3.2 Optionally upgrade meeting description to new format
-      await this.upgradeExistingMeetingDescription(hubspotMeeting, attioMeeting);
-      
+
+      console.log(
+        `   ❗ Associations missing for meeting ${meetingId}: ` +
+        `${missingContacts.length} contacts, ` +
+        `${missingCompanies.length} companies, ` +
+        `${missingDeals.length} deals`
+      );
+
+      if (missingContacts.length) {
+        console.log(`     Missing contact IDs: ${missingContacts.join(', ')}`);
+      }
+      if (missingCompanies.length) {
+        console.log(`     Missing company IDs: ${missingCompanies.join(', ')}`);
+      }
+      if (missingDeals.length) {
+        console.log(`     Missing deal IDs: ${missingDeals.join(', ')}`);
+      }
+
+      // NOTE: Right now this function is only used as a verifier.
+      // If you later want it to auto-fix, you can:
+      //  - build a reduced set with only the missing IDs, and
+      //  - call `this.hubspot.batchCreateAssociations(...)` like in
+      //    createAssociationsForMeeting.
+
     } catch (error) {
-      console.error(`   ❌ Error verifying associations for meeting ${hubspotMeeting.id}:`, error.message);
+      console.error(
+        `   ❌ Error verifying associations for meeting ${hubspotMeeting?.id}:`,
+        error.message
+      );
+    }
+  }
+
+  /**
+   * Fix associations for an existing HubSpot meeting:
+   * - Reads existing associations (contacts/companies/deals)
+   * - Computes what's missing based on Attio
+   * - Creates ONLY the missing associations
+   */
+  async fixMeetingAssociations(hubspotMeeting, attioMeeting) {
+    try {
+      if (!hubspotMeeting || !hubspotMeeting.id) {
+        console.log('   ⚠️ Cannot fix associations: missing HubSpot meeting ID');
+        return;
+      }
+
+      const meetingId = hubspotMeeting.id;
+      console.log(`   🔧 Fixing associations for meeting ${meetingId}...`);
+
+      // 1) Read existing associations
+      const existingContacts = new Set();
+      const existingCompanies = new Set();
+      const existingDeals = new Set();
+
+      try {
+        const existing = await this.hubspot.client.get(
+          `/crm/v3/objects/meetings/${meetingId}`,
+          { params: { associations: 'contacts,companies,deals' } }
+        );
+
+        const assoc = existing.data?.associations || {};
+
+        if (assoc.contacts?.results?.length) {
+          assoc.contacts.results.forEach(r => existingContacts.add(r.id));
+        }
+        if (assoc.companies?.results?.length) {
+          assoc.companies.results.forEach(r => existingCompanies.add(r.id));
+        }
+        if (assoc.deals?.results?.length) {
+          assoc.deals.results.forEach(r => existingDeals.add(r.id));
+        }
+
+        console.log(
+          `     Existing: ${existingContacts.size} contacts, ` +
+          `${existingCompanies.size} companies, ${existingDeals.size} deals`
+        );
+      } catch (error) {
+        if (error.response?.status === 404) {
+          console.log(
+            `   ⚠️ Meeting ${meetingId} returned 404 when reading associations. ` +
+            `It may have been deleted – skipping fix for this record.`
+          );
+          return;
+        }
+        throw error;
+      }
+
+      // 2) Desired associations
+      const { contactIds, companyIds, dealIds } =
+        await this.getDesiredAssociationsForMeeting(attioMeeting);
+
+      const desiredContacts = Array.from(contactIds || []);
+      const desiredCompanies = Array.from(companyIds || []);
+      const desiredDeals = Array.from(dealIds || []);
+
+      // 3) Compute missing ones
+      const missingContacts = desiredContacts.filter(id => !existingContacts.has(id));
+      const missingCompanies = desiredCompanies.filter(id => !existingCompanies.has(id));
+      const missingDeals = desiredDeals.filter(id => !existingDeals.has(id));
+
+      const totalMissing =
+        missingContacts.length + missingCompanies.length + missingDeals.length;
+
+      if (totalMissing === 0) {
+        console.log(`   ✅ Associations already correct for meeting ${meetingId}`);
+        return;
+      }
+
+      console.log(
+        `   ❗ Fixing ${totalMissing} missing associations for meeting ${meetingId} ` +
+        `(${missingContacts.length} contacts, ` +
+        `${missingCompanies.length} companies, ` +
+        `${missingDeals.length} deals)`
+      );
+
+      const associations = [];
+
+      missingContacts.forEach(contactId => {
+        associations.push({
+          fromObjectType: 'meetings',
+          fromObjectId: meetingId,
+          toObjectType: 'contacts',
+          toObjectId: contactId,
+          associationTypeId: this.ASSOCIATION_TYPE_IDS.meeting_to_contact
+        });
+      });
+
+      missingCompanies.forEach(companyId => {
+        associations.push({
+          fromObjectType: 'meetings',
+          fromObjectId: meetingId,
+          toObjectType: 'companies',
+          toObjectId: companyId,
+          associationTypeId: this.ASSOCIATION_TYPE_IDS.meeting_to_company
+        });
+      });
+
+      missingDeals.forEach(dealId => {
+        associations.push({
+          fromObjectType: 'meetings',
+          fromObjectId: meetingId,
+          toObjectType: 'deals',
+          toObjectId: dealId,
+          associationTypeId: this.ASSOCIATION_TYPE_IDS.meeting_to_deal
+        });
+      });
+
+      if (associations.length > 0) {
+        console.log(`     📎 Creating ${associations.length} missing associations...`);
+        await this.hubspot.batchCreateAssociations(associations);
+        console.log(`     ✅ Created missing associations for meeting ${meetingId}`);
+      }
+
+    } catch (error) {
+      console.error(
+        `   ❌ Error fixing associations for meeting ${hubspotMeeting?.id}:`,
+        error.message
+      );
+    }
+  }
+
+  /**
+   * DRY RUN: Analyze associations for an existing meeting without writing anything.
+   * Returns the number of missing associations (contacts + companies + deals).
+   */
+  async analyzeMeetingAssociationsDryRun(hubspotMeeting, attioMeeting) {
+    try {
+      if (!hubspotMeeting || !hubspotMeeting.id) {
+        console.log('   ⚠️ [DRY RUN] Cannot analyze associations: missing HubSpot meeting ID');
+        return 0;
+      }
+
+      const meetingId = hubspotMeeting.id;
+      console.log(`   🔍 [DRY RUN] Checking associations for meeting ${meetingId}...`);
+
+      // -------------------------------------------------------------------
+      // 1) Get existing associations from HubSpot (READ-ONLY)
+      // -------------------------------------------------------------------
+      const existingContacts = new Set();
+      const existingCompanies = new Set();
+      const existingDeals = new Set();
+
+      try {
+        const existing = await this.hubspot.client.get(
+          `/crm/v3/objects/meetings/${meetingId}`,
+          {
+            params: {
+              associations: 'contacts,companies,deals'
+            }
+          }
+        );
+
+        const assoc = existing.data?.associations || {};
+
+        if (assoc.contacts?.results?.length) {
+          assoc.contacts.results.forEach(r => existingContacts.add(r.id));
+        }
+        if (assoc.companies?.results?.length) {
+          assoc.companies.results.forEach(r => existingCompanies.add(r.id));
+        }
+        if (assoc.deals?.results?.length) {
+          assoc.deals.results.forEach(r => existingDeals.add(r.id));
+        }
+      } catch (error) {
+        if (error.response?.status === 404) {
+          console.log(
+            `   ⚠️ [DRY RUN] Meeting ${meetingId} returned 404 when reading associations. ` +
+            `Treating as "missing in HubSpot" and skipping association analysis for this record.`
+          );
+          return 0;
+        }
+
+        // Anything else is a real failure for this meeting
+        console.error(
+          `   ❌ [DRY RUN] Failed to analyze associations for meeting ${meetingId}:`,
+          error.message
+        );
+        return 0;
+      }
+
+      // -------------------------------------------------------------------
+      // 2) Desired associations from Attio mapping
+      // -------------------------------------------------------------------
+      const { contactIds, companyIds, dealIds } =
+        await this.getDesiredAssociationsForMeeting(attioMeeting);
+
+      const desiredContacts = Array.from(contactIds || []);
+      const desiredCompanies = Array.from(companyIds || []);
+      const desiredDeals = Array.from(dealIds || []);
+
+      // DEBUG: Log what we found
+      console.log(`     [DEBUG] Desired associations: ${desiredContacts.length} contacts, ${desiredCompanies.length} companies, ${desiredDeals.length} deals`);
+      
+      if (desiredContacts.length === 0 && desiredCompanies.length === 0 && desiredDeals.length === 0) {
+        console.log(`     [DEBUG] No desired associations found from Attio data - checking Attio meeting structure:`);
+        console.log(`     [DEBUG] Meeting values keys: ${Object.keys(attioMeeting.values || {}).join(', ')}`);
+        console.log(`     [DEBUG] Direct meeting keys: ${Object.keys(attioMeeting).join(', ')}`);
+        
+        // Sample some potential data
+        const values = attioMeeting.values || {};
+        if (values.participants) console.log(`     [DEBUG] Participants count: ${values.participants.length}`);
+        if (values.linked_records) console.log(`     [DEBUG] Linked records count: ${values.linked_records.length}`);
+        if (values.attendees) console.log(`     [DEBUG] Attendees count: ${values.attendees.length}`);
+      }
+
+      // -------------------------------------------------------------------
+      // 3) Diff + stats
+      // -------------------------------------------------------------------
+      const missingContacts = desiredContacts.filter(id => !existingContacts.has(id));
+      const missingCompanies = desiredCompanies.filter(id => !existingCompanies.has(id));
+      const missingDeals = desiredDeals.filter(id => !existingDeals.has(id));
+
+      const totalMissing =
+        missingContacts.length + missingCompanies.length + missingDeals.length;
+
+      if (totalMissing === 0) {
+        console.log(`   ✅ [DRY RUN] Associations already correct for meeting ${meetingId}`);
+      } else {
+        console.log(
+          `   ❗ [DRY RUN] ${totalMissing} missing associations for meeting ${meetingId} ` +
+          `(${missingContacts.length} contacts, ` +
+          `${missingCompanies.length} companies, ` +
+          `${missingDeals.length} deals)`
+        );
+      }
+
+      return totalMissing;
+    } catch (error) {
+      const status = error.response?.status;
+      const message = error.message || String(error || '');
+
+      if (status === 404 || /404/.test(message)) {
+        console.log(
+          `   ⚠️ [DRY RUN] Meeting ${meetingId} not found in CRM (404). ` +
+          `Most likely a legacy engagement or a deleted record – skipping association analysis for this one.`
+        );
+        return 0;
+      }
+
+      console.error(
+        `   ❌ [DRY RUN] Unexpected error while analyzing associations for meeting ${meetingId}:`,
+        message
+      );
+      return 0;
     }
   }
 
@@ -776,7 +1235,10 @@ ${participantLines.join('\n')}`;
         attioMeeting.people ||
         [];
 
-      const participantLines = participants.map(p => {
+      const participantLines = [];
+      const attendeeEmails = []; // Collect emails for HubSpot attendees field
+      
+      participants.forEach(p => {
         const name =
           p.name ||
           p.full_name ||
@@ -788,11 +1250,16 @@ ${participantLines.join('\n')}`;
         const status = p.status ? ` [${p.status}]` : '';
         const role = p.is_organizer ? ' (host)' : '';
 
+        // Add email to attendees list if valid
+        if (email && email.includes('@')) {
+          attendeeEmails.push(email);
+        }
+
         let label = name || email || 'Unknown participant';
         if (email && name) label += ` <${email}>`;
         else if (email && !name) label = email;
 
-        return `- ${label}${role}${status}`;
+        participantLines.push(`- ${label}${role}${status}`);
       });
 
       let participantsSection = '';
@@ -809,14 +1276,22 @@ ${participantLines.join('\n')}`;
 
       const newBody = bodyLines.join('\n');
       
-      // Update the meeting description
+      // Prepare the update properties
+      const updateProperties = {
+        hs_meeting_body: newBody
+      };
+
+      // Add attendee emails if we have any
+      if (attendeeEmails.length > 0) {
+        updateProperties.hs_attendee_emails = attendeeEmails.join(';');
+      }
+      
+      // Update the meeting description and attendees
       await this.hubspot.client.patch(`/crm/v3/objects/meetings/${hubspotMeeting.id}`, {
-        properties: {
-          hs_meeting_body: newBody
-        }
+        properties: updateProperties
       });
       
-      console.log(`     ✅ Upgraded description with ${participants.length} participants`);
+      console.log(`     ✅ Upgraded description and attendees with ${participants.length} participants (${attendeeEmails.length} emails)`);
       
     } catch (error) {
       console.error(`     ⚠️ Failed to upgrade description: ${error.message}`);
@@ -857,11 +1332,75 @@ ${participantLines.join('\n')}`;
       console.log('\n🔍 STEP 2: Analyzing meeting synchronization\n');
       const { hubspotByAttioId, missingInHubSpot, existingInHubSpot } = this.verifyMeetingSync(attioMeetings, hubspotMeetings);
       
+      // Filter to only CRM meetings (those with hs_meeting_body property) for association analysis
+      // Legacy engagement meetings don't support the CRM v3 associations endpoint
+      const crmExistingInHubSpot = existingInHubSpot.filter(
+        ({ hubspotMeeting }) =>
+          hubspotMeeting &&
+          hubspotMeeting.properties &&
+          hubspotMeeting.properties.hs_meeting_body !== undefined
+      );
+      
+      console.log(`📊 [DRY RUN] Existing meetings in HubSpot: ${existingInHubSpot.length}`);
+      console.log(`📊 [DRY RUN] CRM meetings (v3) eligible for association checks: ${crmExistingInHubSpot.length}`);
+      
+      console.log('\n🔍 STEP 3 (DRY RUN): Analyzing associations for existing CRM meetings\n');
+
+      let meetingsWithMissingAssociations = 0;
+      let totalMissingAssociations = 0;
+
+      if (crmExistingInHubSpot.length > 0) {
+        for (let i = 0; i < crmExistingInHubSpot.length; i++) {
+          const { hubspotMeeting, attioMeeting } = crmExistingInHubSpot[i];
+          const attioId = attioMeeting?.id?.meeting_id || attioMeeting?.values?.original_id?.[0]?.value || 'unknown';
+          console.log(
+            `[${i + 1}/${crmExistingInHubSpot.length}] ` +
+            `Analyzing associations for meeting ${hubspotMeeting.id} (Attio ID: ${attioId}) (DRY RUN)...`
+          );
+
+          const missingCount = await this.analyzeMeetingAssociationsDryRun(
+            hubspotMeeting,
+            attioMeeting
+          );
+
+          if (missingCount > 0) {
+            meetingsWithMissingAssociations++;
+            totalMissingAssociations += missingCount;
+          }
+
+          // Light throttling for safety
+          if (i > 0 && i % 25 === 0) {
+            await new Promise(resolve => setTimeout(resolve, 500));
+          }
+        }
+        
+        console.log(
+          `\n✅ [DRY RUN] Association analysis complete for existing CRM meetings.`
+        );
+        console.log(
+          `   → Total CRM meetings checked: ${crmExistingInHubSpot.length}`
+        );
+        console.log(
+          `   → Total missing associations across all CRM meetings: ${totalMissingAssociations}`
+        );
+      } else {
+        console.log(
+          '\nℹ️ [DRY RUN] No CRM meetings found in HubSpot to analyze associations for.'
+        );
+      }
+      
       console.log('============================================================');
       console.log('🧪 DRY RUN SUMMARY - WHAT WOULD HAPPEN:');
       console.log('============================================================');
       console.log(`🆕 New meetings to create: ${missingInHubSpot.length}`);
-      console.log(`🔄 Existing meetings to verify associations: ${existingInHubSpot.length}`);
+      console.log(`🔄 Existing meetings in HubSpot (total): ${existingInHubSpot.length}`);
+      console.log(`🔄 CRM meetings analyzed for associations: ${crmExistingInHubSpot?.length || 0}`);
+      console.log(
+        `⚠️ Meetings with missing associations (DRY RUN): ${meetingsWithMissingAssociations}`
+      );
+      console.log(
+        `📎 Total missing associations (DRY RUN): ${totalMissingAssociations}`
+      );
       console.log(`📋 Total Attio meetings: ${attioMeetings.length}`);
       console.log(`📋 Total HubSpot meetings: ${hubspotMeetings.length}`);
       console.log('============================================================');
@@ -995,13 +1534,14 @@ ${participantLines.join('\n')}`;
       console.log(`   ❌ Failed meetings: ${errorCount}`);
       console.log(`   ⏭️ Skipped meetings: ${this.skippedCount}`);
       
-      console.log('\\n🔍 STEP 4: Verifying and fixing associations for existing meetings\\n');
+      console.log('\\n🔍 STEP 4: Fixing associations for existing meetings\\n');
       
       for (let i = 0; i < existingInHubSpot.length; i++) {
         const { hubspotMeeting, attioMeeting } = existingInHubSpot[i];
-        console.log(`[${i + 1}/${existingInHubSpot.length}] Verifying associations...`);
+        console.log(`[${i + 1}/${existingInHubSpot.length}] Fixing associations and participants...`);
         
-        await this.verifyMeetingAssociations(hubspotMeeting, attioMeeting);
+        await this.fixMeetingAssociations(hubspotMeeting, attioMeeting);
+        await this.upgradeExistingMeetingDescription(hubspotMeeting, attioMeeting);
         
         // Rate limiting
         if (i % 10 === 0 && i > 0) {
