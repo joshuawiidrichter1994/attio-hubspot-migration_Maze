@@ -160,10 +160,10 @@ class AttioAPI {
     let allMeetings = [];
     let cursor = null;
     
-    // Set max date to TODAY unless specified otherwise
-    // For upcoming meetings, nothing before today should be migrated
+    // Set max date to RIGHT NOW unless specified otherwise
+    // Block any meetings past this exact moment
     const cutoffDate = maxDate ? new Date(maxDate) : new Date();
-    cutoffDate.setHours(0, 0, 0, 0); // Start of today
+    // No time manipulation - use the exact current timestamp
     
     console.log(`📅 Filtering meetings to exclude anything scheduled after: ${cutoffDate.toISOString()}`);
     

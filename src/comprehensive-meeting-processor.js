@@ -638,10 +638,11 @@ ${participantLines.join('\n')}`;
     };
 
     // Add attendee emails if we have any
-    if (attendeeEmails.length > 0) {
-      // HubSpot expects attendee emails as a semicolon-separated string
-      meetingData.properties.hs_attendee_emails = attendeeEmails.join(';');
-    }
+    // Note: hs_attendee_emails is not a valid HubSpot meeting property
+    // The attendee information is preserved in the meeting description
+    // if (attendeeEmails.length > 0) {
+    //   meetingData.properties.hs_attendee_emails = attendeeEmails.join(';');
+    // }
 
     // Add end time if available
     if (endTime) {
@@ -1282,9 +1283,11 @@ ${participantLines.join('\n')}`;
       };
 
       // Add attendee emails if we have any
-      if (attendeeEmails.length > 0) {
-        updateProperties.hs_attendee_emails = attendeeEmails.join(';');
-      }
+      // Note: hs_attendee_emails is not a valid HubSpot meeting property  
+      // The attendee information is preserved in the meeting description
+      // if (attendeeEmails.length > 0) {
+      //   updateProperties.hs_attendee_emails = attendeeEmails.join(';');
+      // }
       
       // Update the meeting description and attendees
       await this.hubspot.client.patch(`/crm/v3/objects/meetings/${hubspotMeeting.id}`, {

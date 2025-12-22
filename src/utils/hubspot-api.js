@@ -78,6 +78,27 @@ class HubSpotAPI {
     }, `HubSpot legacy meetings fetch (limit=${limit}, offset=${offset})`);
   }
 
+  /**
+   * Search for meetings using HubSpot search API
+   * @param {Object} searchOptions - Search parameters
+   * @param {string} searchOptions.query - Search query string
+   * @param {number} searchOptions.limit - Maximum number of results
+   * @param {Array} searchOptions.properties - Properties to return
+   * @returns {Promise} Search results
+   */
+  async searchMeetings({ query, limit = 10, properties = ['hs_meeting_title', 'hs_meeting_body', 'hs_meeting_start_time', 'hs_meeting_end_time'] }) {
+    return this.retryWithBackoff(async () => {
+      const searchPayload = {
+        query: query,
+        limit: limit,
+        properties: properties
+      };
+      
+      const response = await this.client.post('/crm/v3/objects/meetings/search', searchPayload);
+      return response.data;
+    }, `HubSpot meeting search (query=${query}, limit=${limit})`);
+  }
+
   async getAllMeetings() {
     let allMeetings = [];
     
@@ -296,17 +317,17 @@ class HubSpotAPI {
         console.log(`Processing association batch ${Math.floor(i/batchSize) + 1}/${Math.ceil(typeAssociations.length/batchSize)} for ${fromObjectType} to ${toObjectType}`);
         
         try {
+          // Use default association endpoint for unlabeled associations
           const inputs = batch.map(association => ({
             from: { id: association.fromObjectId },
-            to: { id: association.toObjectId },
-            type: association.associationTypeId || association.associationType // Support both until migration complete
+            to: { id: association.toObjectId }
           }));
 
-          console.log(`Sending batch request to: /crm/v4/associations/${fromObjectType}/${toObjectType}/batch/create`);
+          console.log(`Sending batch request to: /crm/v4/associations/${fromObjectType}/${toObjectType}/batch/associate/default`);
           console.log(`Request payload:`, JSON.stringify({ inputs }, null, 2));
 
           const response = await this.client.post(
-            `/crm/v4/associations/${fromObjectType}/${toObjectType}/batch/create`,
+            `/crm/v4/associations/${fromObjectType}/${toObjectType}/batch/associate/default`,
             { inputs }
           );
           
